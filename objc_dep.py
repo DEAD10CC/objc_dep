@@ -9,7 +9,7 @@ Input: path of an Objective-C project
 
 Output: import dependencies Graphviz format
 
-Typical usage: $ python objc_dep.py /path/to/project > graph.dot
+Typical usage: $ python objc_dep.py /path/to/project [-x regex] [-i subfolder [subfolder ...]] > graph.dot
 
 The .dot file can be opened with Graphviz or OmniGraffle.
 
@@ -24,18 +24,20 @@ import re
 from os.path import basename
 import argparse
 
-regex_import = re.compile("^#(import|include) \"(?P<filename>\S*)\.h")
+local_regex_import = re.compile("^\s*#(?:import|include)\s+\"(?P<filename>\S*)(?P<extension>\.(?:h|hpp|hh))?\"")
+system_regex_import = re.compile("^\s*#(?:import|include)\s+[\"<](?P<filename>\S*)(?P<extension>\.(?:h|hpp|hh))?[\">]")
 
-def gen_filenames_imported_in_file(path, regex_exclude):
+def gen_filenames_imported_in_file(path, regex_exclude, system, extensions):
     for line in open(path):
-        results = re.search(regex_import, line)
+        results = re.search(system_regex_import, line) if system else re.search(local_regex_import, line)
         if results:
             filename = results.group('filename')
-            if regex_exclude is not None and regex_exclude.search(filename):
+            extension = results.group('extension') if results.group('extension') else ""
+            if regex_exclude is not None and regex_exclude.search(filename + extension):
                 continue
-            yield filename
+            yield (filename + extension) if extension else filename
 
-def dependencies_in_project(path, ext, exclude):
+def dependencies_in_project(path, ext, exclude, ignore, system, extensions):
     d = {}
     
     regex_exclude = None
@@ -44,11 +46,16 @@ def dependencies_in_project(path, ext, exclude):
     
     for root, dirs, files in os.walk(path):
 
+        if ignore:
+            for subfolder in ignore:
+                if subfolder in dirs:
+                    dirs.remove(subfolder)
+
         objc_files = (f for f in files if f.endswith(ext))
 
         for f in objc_files:
-            filename = os.path.splitext(f)[0]
             
+            filename = f if extensions else os.path.splitext(f)[0]
             if regex_exclude is not None and regex_exclude.search(filename):
                 continue
 
@@ -56,19 +63,20 @@ def dependencies_in_project(path, ext, exclude):
                 d[filename] = Set()
             
             path = os.path.join(root, f)
-            
-            for imported_filename in gen_filenames_imported_in_file(path, regex_exclude):
-                if imported_filename != filename and '+' not in imported_filename:
+
+            for imported_filename in gen_filenames_imported_in_file(path, regex_exclude, system, extensions):
+                if imported_filename != filename and '+' not in imported_filename and '+' not in filename:
+                    imported_filename = imported_filename if extensions else os.path.splitext(imported_filename)[0]
                     d[filename].add(imported_filename)
 
     return d
 
-def dependencies_in_project_with_file_extensions(path, exts, exclude):
+def dependencies_in_project_with_file_extensions(path, exts, exclude, ignore, system, extensions):
 
     d = {}
     
     for ext in exts:
-        d2 = dependencies_in_project(path, ext, exclude)
+        d2 = dependencies_in_project(path, ext, exclude, ignore, system, extensions)
         for (k, v) in d2.iteritems():
             if not k in d:
                 d[k] = Set()
@@ -91,6 +99,17 @@ def two_ways_dependencies(d):
                     two_ways.add((a, b))
                     
     return two_ways
+
+def untraversed_files(d):
+
+    dead_ends = Set()
+
+    for file_a, file_a_dependencies in d.iteritems():
+        for file_b in file_a_dependencies:
+            if not file_b in dead_ends and not file_b in d:
+                dead_ends.add(file_b)
+
+    return dead_ends
 
 def category_files(d):
     d2 = {}
@@ -133,16 +152,17 @@ def print_frequencies_chart(d):
     for i in range(0, max_length+1):
         s = "%2d | %s\n" % (i, ", ".join(sorted(list(l[i]))))
         sys.stderr.write(s)
-        
-def dependencies_in_dot_format(path, exclude):
 
-    d = dependencies_in_project_with_file_extensions(path, ['.h', '.hpp', '.m', '.mm', '.c', '.cc', '.cpp'], exclude)
+def dependencies_in_dot_format(path, exclude, ignore, system, extensions):
+    
+    d = dependencies_in_project_with_file_extensions(path, ['.h', '.hh', '.hpp', '.m', '.mm', '.c', '.cc', '.cpp'], exclude, ignore, system, extensions)
 
     two_ways_set = two_ways_dependencies(d)
+    untraversed_set = untraversed_files(d)
 
     category_list, d = category_files(d)
 
-    pch_set = dependencies_in_project(path, '.pch', exclude)
+    pch_set = dependencies_in_project(path, '.pch', exclude, ignore, system, extensions)
 
     #
     
@@ -158,7 +178,6 @@ def dependencies_in_dot_format(path, exclude):
     l = []
     l.append("digraph G {")
     l.append("\tnode [shape=box];")
-    two_ways = Set()
 
     for k, deps in d.iteritems():
         if deps:
@@ -168,9 +187,7 @@ def dependencies_in_dot_format(path, exclude):
             l.append("\t\"%s\" -> {};" % (k))
         
         for k2 in deps:
-            if (k, k2) in two_ways_set or (k2, k) in two_ways_set:
-                two_ways.add((k, k2))
-            else:
+            if not ((k, k2) in two_ways_set or (k2, k) in two_ways_set):
                 l.append("\t\"%s\" -> \"%s\";" % (k, k2))
 
     l.append("\t")
@@ -180,10 +197,13 @@ def dependencies_in_dot_format(path, exclude):
             l.append("\t\"%s\" -> \"%s\" [color=red];" % (k, x))
     
     l.append("\t")
-    l.append("\tedge [color=blue];")
+    l.append("\tedge [color=blue, dir=both];")
 
-    for (k, k2) in two_ways:
+    for (k, k2) in two_ways_set:
         l.append("\t\"%s\" -> \"%s\";" % (k, k2))
+
+    for k in untraversed_set:
+        l.append("\t\"%s\" [color=gray, style=dashed, fontcolor=gray]" % k)
     
     if category_list:
         l.append("\t")
@@ -191,16 +211,24 @@ def dependencies_in_dot_format(path, exclude):
         l.append("\tnode [shape=plaintext];")
         l.append("\t\"Categories\" [label=\"%s\"];" % "\\n".join(category_list))
 
+    if ignore:
+        l.append("\t")
+        l.append("\tnode [shape=box, color=blue];")
+        l.append("\t\"Ignored\" [label=\"%s\"];" % "\\n".join(ignore))
+
     l.append("}\n")
     return '\n'.join(l)
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("-x", "--exclude", nargs='?', default='' ,help="regular expression of substrings to exclude from module names")
+    parser.add_argument("-i", "--ignore", nargs='*', help="list of subfolder names to ignore")
+    parser.add_argument("-s", "--system", action='store_true', default=False, help="include system dependencies")
+    parser.add_argument("-e", "--extensions", action='store_true', default=False, help="print file extensions")
     parser.add_argument("project_path", help="path to folder hierarchy containing Objective-C files")
-    parser.add_argument("-x", "--exclude", help="regular expression of substrings to exclude from module names")
     args= parser.parse_args()
 
-    print dependencies_in_dot_format(args.project_path, args.exclude)
-  
+    print dependencies_in_dot_format(args.project_path, args.exclude, args.ignore, args.system, args.extensions)
+
 if __name__=='__main__':
     main()
